@@ -91,7 +91,7 @@ def load_model_and_tokenizer(model_name: str) -> Tuple[torch.nn.Module, AutoToke
     """加载模型和tokenizer"""
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype="auto",
+        torch_dtype=torch.float16,  # 强制使用半精度推理 FP16
         device_map="auto",
         trust_remote_code=True
     )
