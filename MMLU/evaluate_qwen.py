@@ -6,19 +6,16 @@ import pandas as pd
 from categories import subcategories, categories
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
+from typing import Dict, List, Tuple
 
 choices = ["A", "B", "C", "D"]
 
+def format_subject(subject: str) -> str:
+    """将下划线分隔的主题转换为自然语言格式"""
+    return " ".join(subject.split("_"))
 
-def format_subject(subject):
-    l = subject.split("_")
-    s = ""
-    for entry in l:
-        s += " " + entry
-    return s
-
-
-def format_example(df, idx, include_answer=True):
+def format_example(df: pd.DataFrame, idx: int, include_answer: bool = True) -> str:
+    """格式化单个问题示例"""
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
@@ -28,8 +25,8 @@ def format_example(df, idx, include_answer=True):
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
 
-
-def gen_prompt(train_df, subject, k=-1):
+def gen_prompt(train_df: pd.DataFrame, subject: str, k: int = -1) -> str:
+    """生成包含k个示例的提示模板"""
     prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(
         format_subject(subject)
     )
@@ -39,150 +36,164 @@ def gen_prompt(train_df, subject, k=-1):
         prompt += format_example(train_df, i)
     return prompt
 
-
-@torch.no_grad()
-def eval(args, subject, model, tokenizer, dev_df, test_df):
+@torch.inference_mode()
+def eval(args: argparse.Namespace, 
+         subject: str, 
+         model: torch.nn.Module, 
+         tokenizer: AutoTokenizer,
+         dev_df: pd.DataFrame, 
+         test_df: pd.DataFrame) -> Tuple[np.ndarray, float, np.ndarray]:
+    """评估模型在指定学科上的表现"""
     cors = []
     all_probs = []
-    answers = choices[: test_df.shape[1] - 2] # 掐头去尾（问题和答案）
-
+    answers = choices[: test_df.shape[1] - 2]
+    
+    # 预编码选项token
+    option_ids = [tokenizer(choice).input_ids[-1] for choice in choices]  # 取最后一个token避免前缀问题
+    
     for i in range(test_df.shape[0]):
-        # get prompt and make sure it fits
+        # 动态调整prompt长度
         k = args.ntrain
         prompt_end = format_example(test_df, i, include_answer=False)
         train_prompt = gen_prompt(dev_df, subject, k)
         prompt = train_prompt + prompt_end
-
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
-
-        while input_ids.shape[-1] > 2048:
-            k -= 1
-            train_prompt = gen_prompt(dev_df, subject, k)
-            prompt = train_prompt + prompt_end
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
-        # 找到合适的训练条数
         
-        label = test_df.iloc[i, test_df.shape[1] - 1] # 答案
-
-        decoder_input_ids = tokenizer("", return_tensors="pt").input_ids.cuda()
-        decoder_input_ids = model._shift_right(decoder_input_ids)
-        logits = model(
-            input_ids=input_ids, decoder_input_ids=decoder_input_ids
-        ).logits.flatten()
-
-        probs = (
-            torch.nn.functional.softmax(
-                torch.tensor(
-                    [
-                        logits[tokenizer("A").input_ids[0]],
-                        logits[tokenizer("B").input_ids[0]],
-                        logits[tokenizer("C").input_ids[0]],
-                        logits[tokenizer("D").input_ids[0]],
-                    ]
-                ),
-                dim=0,
-            )
-            .detach()
-            .cpu()
-            .numpy()
+        # 智能截断处理
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=model.config.max_position_embeddings - 50  # 保留缓冲
         )
-        pred = {0: "A", 1: "B", 2: "C", 3: "D"}[np.argmax(probs)]
-
-        cor = pred == label
-        cors.append(cor)
+        input_ids = inputs.input_ids.to(model.device)
+        
+        # 模型推理
+        outputs = model(input_ids=input_ids)
+        last_token_logits = outputs.logits[:, -1, :]  # 取最后一个token的logits
+        
+        # 计算选项概率
+        probs = torch.nn.functional.softmax(
+            last_token_logits[:, option_ids], 
+            dim=-1
+        ).cpu().numpy().flatten()
+        
+        # 预测结果
+        pred = choices[np.argmax(probs)]
+        label = test_df.iloc[i, test_df.shape[1] - 1]
+        cors.append(pred == label)
         all_probs.append(probs)
 
     acc = np.mean(cors)
-    cors = np.array(cors)
+    print(f"Average accuracy {acc:.3f} - {subject}")
+    return np.array(cors), acc, np.array(all_probs)
 
-    all_probs = np.array(all_probs)
-    print("Average accuracy {:.3f} - {}".format(acc, subject))
-
-    return cors, acc, all_probs
-
-
-def main(args):
-
-    model_name=args.model
+def load_model_and_tokenizer(model_name: str) -> Tuple[torch.nn.Module, AutoTokenizer]:
+    """加载模型和tokenizer"""
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype="auto",
-        device_map="auto"
+        device_map="auto",
+        trust_remote_code=True
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-   
-    # model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        padding_side="left"  # 因果LM需要左填充
+    )
     
-    # 获取所有测试集中的学科名称
-    subjects = sorted(
-        [
-            f.split("_test.csv")[0]
-            for f in os.listdir(os.path.join(args.data_dir, "test"))
-            if "_test.csv" in f
-        ]
-    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    return model, tokenizer
 
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-    if not os.path.exists(os.path.join(args.save_dir, "results_{}".format(args.model))):
-        os.makedirs(os.path.join(args.save_dir, "results_{}".format(args.model)))
-
+def main(args: argparse.Namespace):
+    """主执行流程"""
+    # 初始化模型
+    model, tokenizer = load_model_and_tokenizer(args.model)
+    
+    # 准备目录结构
+    os.makedirs(args.save_dir, exist_ok=True)
+    results_dir = os.path.join(args.save_dir, f"results_{args.model}")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # 获取测试学科
+    subjects = sorted([
+        f.split("_test.csv")[0]
+        for f in os.listdir(os.path.join(args.data_dir, "test"))
+        if "_test.csv" in f
+    ])
+    
+    # 初始化结果容器
     all_cors = []
     subcat_cors = {
-        subcat: [] for subcat_lists in subcategories.values() for subcat in subcat_lists
+        subcat: [] for subcat_lists in subcategories.values() 
+        for subcat in subcat_lists
     }
     cat_cors = {cat: [] for cat in categories}
-
+    
+    # 分学科评估
     for subject in subjects:
-        dev_df = pd.read_csv(
-            os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None
-        )[: args.ntrain]
-        test_df = pd.read_csv(
-            os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None
-        )
-
-        cors, acc, probs = eval(args, subject, model, tokenizer, dev_df, test_df)
-        subcats = subcategories[subject]
-        for subcat in subcats:
-            subcat_cors[subcat].append(cors)
-            for key in categories.keys():
-                if subcat in categories[key]:
-                    cat_cors[key].append(cors)
-        all_cors.append(cors)
-
-        test_df["{}_correct".format(args.model)] = cors
-        for j in range(probs.shape[1]):
-            choice = choices[j]
-            test_df["{}_choice{}_probs".format(args.model, choice)] = probs[:, j]
-        test_df.to_csv(
-            os.path.join(
-                args.save_dir, "results_{}".format(args.model), "{}.csv".format(subject)
-            ),
-            index=None,
-        )
-
+        try:
+            dev_df = pd.read_csv(
+                os.path.join(args.data_dir, "dev", f"{subject}_dev.csv"), 
+                header=None
+            )[:args.ntrain]
+            test_df = pd.read_csv(
+                os.path.join(args.data_dir, "test", f"{subject}_test.csv"),
+                header=None
+            )
+            
+            cors, acc, probs = eval(args, subject, model, tokenizer, dev_df, test_df)
+            
+            # 记录分类结果
+            for subcat in subcategories.get(subject, []):
+                subcat_cors[subcat].append(cors)
+                for cat, subcat_list in categories.items():
+                    if subcat in subcat_list:
+                        cat_cors[cat].append(cors)
+            all_cors.append(cors)
+            
+            # 保存结果
+            test_df[f"{args.model}_correct"] = cors
+            for j, choice in enumerate(choices):
+                test_df[f"{args.model}_choice{choice}_probs"] = probs[:, j]
+            test_df.to_csv(
+                os.path.join(results_dir, f"{subject}.csv"),
+                index=None
+            )
+            
+        except Exception as e:
+            print(f"Error processing {subject}: {str(e)}")
+            continue
+    
+    # 打印汇总结果
     for subcat in subcat_cors:
-        subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
-        print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
-
+        if subcat_cors[subcat]:  # 跳过空列表
+            subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
+            print(f"Average accuracy {subcat_acc:.3f} - {subcat}")
+    
     for cat in cat_cors:
-        cat_acc = np.mean(np.concatenate(cat_cors[cat]))
-        print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
-    weighted_acc = np.mean(np.concatenate(all_cors))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
-
+        if cat_cors[cat]:
+            cat_acc = np.mean(np.concatenate(cat_cors[cat]))
+            print(f"Average accuracy {cat_acc:.3f} - {cat}")
+    
+    if all_cors:
+        weighted_acc = np.mean(np.concatenate(all_cors))
+        print(f"Overall average accuracy: {weighted_acc:.3f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ntrain", "-k", type=int, default=5)
-    parser.add_argument("--ngpu", "-g", type=int, default=1)
-    parser.add_argument("--data_dir", "-d", type=str, default="data")
-    parser.add_argument("--save_dir", "-s", type=str, default="results")
-    parser.add_argument(
-        "--model",
-        "-m",
-        type=str,
-        default="Qwen/Qwen3-8B",
-    )
+    parser.add_argument("--ntrain", "-k", type=int, default=5,
+                      help="Number of few-shot training examples")
+    parser.add_argument("--data_dir", "-d", type=str, default="data",
+                      help="Directory containing test/dev data")
+    parser.add_argument("--save_dir", "-s", type=str, default="results",
+                      help="Directory to save results")
+    parser.add_argument("--model", "-m", type=str, default="Qwen/Qwen3-8B",
+                      help="HuggingFace model identifier")
     args = parser.parse_args()
+    
+    # 启动主流程
+    start_time = time.time()
     main(args)
+    print(f"Total execution time: {time.time() - start_time:.2f} seconds")
