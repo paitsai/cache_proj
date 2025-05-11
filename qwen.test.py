@@ -1,4 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
+from cache.myatt import MyCache
+
 
 model_name = "Qwen/Qwen3-8B"
 
@@ -23,10 +26,16 @@ text = tokenizer.apply_chat_template(
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
+
+past_cache_matrix=DynamicCache()
+past_cache_matrix=MyCache()
+
+
 # conduct text completion
 generated_ids = model.generate(
     **model_inputs,
-    max_new_tokens=32768
+    max_new_tokens=32768,
+    past_key_values=past_cache_matrix,
 )
 output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist() 
 
