@@ -8,6 +8,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 from typing import Dict, List, Tuple
 
+from transformers.cache_utils import DynamicCache
+from cache.myatt import MyCache
+
+
 choices = ["A", "B", "C", "D"]
 
 def format_subject(subject: str) -> str:
@@ -87,13 +91,21 @@ def eval(args: argparse.Namespace,
     print(f"Average accuracy {acc:.3f} - {subject}")
     return np.array(cors), acc, np.array(all_probs)
 
-def load_model_and_tokenizer(model_name: str) -> Tuple[torch.nn.Module, AutoTokenizer]:
+def load_model_and_tokenizer(model_name: str, cache_type: str="_") -> Tuple[torch.nn.Module, AutoTokenizer]:
+    
+    if cache_type == "xzr":
+        past_kv_matrix=MyCache()
+    elif cache_type == "windows":  
+        past_kv_matrix=MyCache(initial_size=0)
+    else:
+        past_kv_matrix=DynamicCache()    
     """加载模型和tokenizer"""
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,  # 强制使用半精度推理 FP16
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+        past_key_values=past_kv_matrix,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -109,7 +121,7 @@ def load_model_and_tokenizer(model_name: str) -> Tuple[torch.nn.Module, AutoToke
 def main(args: argparse.Namespace):
     """主执行流程"""
     # 初始化模型
-    model, tokenizer = load_model_and_tokenizer(args.model)
+    model, tokenizer = load_model_and_tokenizer(args.model, args.cache_type)
     
     # 准备目录结构
     os.makedirs(args.save_dir, exist_ok=True)
@@ -191,6 +203,8 @@ if __name__ == "__main__":
                       help="Directory to save results")
     parser.add_argument("--model", "-m", type=str, default="Qwen/Qwen3-8B",
                       help="HuggingFace model identifier")
+    parser.add_argument("--cache_type", "-m", type=str, default="xzr",
+                      help="请指定需要使用的KV Cache策略...")
     args = parser.parse_args()
     
     # 启动主流程
