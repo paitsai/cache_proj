@@ -14,6 +14,7 @@ class MyCache(Cache):
         self.max_size = initial_size+window_size
         self.initial_size = initial_size
         self.window_size = window_size
+        self._seen_tokens = 0
         
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
