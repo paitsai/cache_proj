@@ -8,8 +8,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 from typing import Dict, List, Tuple
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
 from transformers.cache_utils import DynamicCache
 from cache.myatt import MyCache
+
+
 
 
 choices = ["A", "B", "C", "D"]
@@ -46,7 +52,8 @@ def eval(args: argparse.Namespace,
          model: torch.nn.Module, 
          tokenizer: AutoTokenizer,
          dev_df: pd.DataFrame, 
-         test_df: pd.DataFrame) -> Tuple[np.ndarray, float, np.ndarray]:
+         test_df: pd.DataFrame,
+         cache_type: str="_") -> Tuple[np.ndarray, float, np.ndarray]:
     """评估模型在指定学科上的表现"""
     cors = []
     all_probs = []
@@ -54,7 +61,12 @@ def eval(args: argparse.Namespace,
     
     # 预编码选项token
     option_ids = [tokenizer(choice).input_ids[-1] for choice in choices]  # 取最后一个token避免前缀问题
-    
+    if cache_type == "xzr":
+        past_kv_matrix=MyCache()
+    elif cache_type == "windows":  
+        past_kv_matrix=MyCache(initial_size=0)
+    else:
+        past_kv_matrix=DynamicCache()  
     for i in range(test_df.shape[0]):
         # 动态调整prompt长度
         k = args.ntrain
@@ -72,7 +84,11 @@ def eval(args: argparse.Namespace,
         input_ids = inputs.input_ids.to(model.device)
         
         # 模型推理
-        outputs = model(input_ids=input_ids)
+        outputs = model(
+            input_ids=input_ids,
+            past_key_values=past_kv_matrix,  # 关键参数
+            use_cache=True
+        )
         last_token_logits = outputs.logits[:, -1, :]  # 取最后一个token的logits
         
         # 计算选项概率
@@ -91,21 +107,16 @@ def eval(args: argparse.Namespace,
     print(f"Average accuracy {acc:.3f} - {subject}")
     return np.array(cors), acc, np.array(all_probs)
 
-def load_model_and_tokenizer(model_name: str, cache_type: str="_") -> Tuple[torch.nn.Module, AutoTokenizer]:
+def load_model_and_tokenizer(model_name: str) -> Tuple[torch.nn.Module, AutoTokenizer]:
     
-    if cache_type == "xzr":
-        past_kv_matrix=MyCache()
-    elif cache_type == "windows":  
-        past_kv_matrix=MyCache(initial_size=0)
-    else:
-        past_kv_matrix=DynamicCache()    
+      
     """加载模型和tokenizer"""
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,  # 强制使用半精度推理 FP16
         device_map="auto",
         trust_remote_code=True,
-        past_key_values=past_kv_matrix,
+        
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -121,7 +132,7 @@ def load_model_and_tokenizer(model_name: str, cache_type: str="_") -> Tuple[torc
 def main(args: argparse.Namespace):
     """主执行流程"""
     # 初始化模型
-    model, tokenizer = load_model_and_tokenizer(args.model, args.cache_type)
+    model, tokenizer = load_model_and_tokenizer(args.model)
     
     # 准备目录结构
     os.makedirs(args.save_dir, exist_ok=True)
@@ -155,7 +166,7 @@ def main(args: argparse.Namespace):
                 header=None
             )
             
-            cors, acc, probs = eval(args, subject, model, tokenizer, dev_df, test_df)
+            cors, acc, probs = eval(args, subject, model, tokenizer, dev_df, test_df, args.cache_type)
             
             # 记录分类结果
             for subcat in subcategories.get(subject, []):
