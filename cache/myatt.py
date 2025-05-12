@@ -6,6 +6,28 @@ import torch
 from typing import Optional, Tuple, List, Iterable, Dict, Any
 
 
+def calculate_cache_size(cache: Cache) -> float:
+    """
+    计算 KV Cache 的显存占用（单位 MB）
+    
+    参数:
+        cache (MyCache): 包含 key_cache 和 value_cache 的缓存对象
+    
+    返回:
+        float: 显存占用大小（MB）
+    """
+    total_bytes = 0
+    
+    # 计算所有层的 key_cache 和 value_cache 显存占用
+    for layer_idx in range(len(cache)):
+        if cache.key_cache[layer_idx].numel() > 0:  # 检查是否有有效数据
+            # key_cache 显存 = 元素数量 * 每个元素字节数
+            total_bytes += cache.key_cache[layer_idx].numel() * cache.key_cache[layer_idx].element_size()
+            total_bytes += cache.value_cache[layer_idx].numel() * cache.value_cache[layer_idx].element_size()
+    
+    # 转换为 MB (1 MB = 1024 * 1024 bytes)
+    return total_bytes / (1024 ** 2)
+
 
 
 class MyCache(Cache):
