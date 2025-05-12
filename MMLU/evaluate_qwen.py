@@ -203,7 +203,7 @@ if __name__ == "__main__":
                       help="Directory to save results")
     parser.add_argument("--model", "-m", type=str, default="Qwen/Qwen3-8B",
                       help="HuggingFace model identifier")
-    parser.add_argument("--cache_type", "-m", type=str, default="xzr",
+    parser.add_argument("--cache_type", "-ct", type=str, default="xzr",
                       help="请指定需要使用的KV Cache策略...")
     args = parser.parse_args()
     
